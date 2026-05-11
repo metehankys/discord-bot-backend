@@ -23,7 +23,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "methe_admin_secret_2026";
 // hwid: null = will auto-bind on first login
 const WHITELIST = [
     { username: "metehankys", hwid: null, tier: "admin" },
-    { username: "Metheos", hwid: null, tier: "admin" },
+    { username: "Metheos", hwid: null, tier: "user" },
 ];
 
 // Runtime whitelist (starts as copy of hardcoded, can be modified via API at runtime)
