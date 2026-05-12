@@ -349,3 +349,199 @@ app.listen(PORT, () => {
     console.log(`Whitelist Security System: ENABLED (${runtimeWhitelist.length} users)`);
     console.log(`Active sessions will expire after ${SESSION_TIMEOUT_MS / 60000} minutes without heartbeat`);
 });
+
+// ═══════════════════════════════════════════════════════
+// ███  DISCORD BOT — WHITELIST MANAGEMENT  ███
+// ═══════════════════════════════════════════════════════
+
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
+
+// Environment variables (set these in Render dashboard):
+//   DISCORD_BOT_TOKEN  — Bot token from Discord Developer Portal
+//   DISCORD_ADMIN_IDS  — Comma-separated Discord user IDs allowed to use commands (e.g. "123456,789012")
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || "";
+const DISCORD_ADMIN_IDS = (process.env.DISCORD_ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean);
+
+if (DISCORD_BOT_TOKEN) {
+    const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+    // ── Slash Command Definition ──
+    const whitelistCmd = new SlashCommandBuilder()
+        .setName('whitelist')
+        .setDescription('Whitelist yönetim komutları')
+        .addSubcommand(sub =>
+            sub.setName('ekle')
+                .setDescription('Whitelist\'e yeni kullanıcı ekle')
+                .addStringOption(opt => opt.setName('isim').setDescription('Minecraft kullanıcı adı').setRequired(true))
+                .addStringOption(opt => opt.setName('tier').setDescription('Yetki seviyesi (user/admin)').setRequired(false))
+        )
+        .addSubcommand(sub =>
+            sub.setName('sil')
+                .setDescription('Whitelist\'ten kullanıcı sil')
+                .addStringOption(opt => opt.setName('isim').setDescription('Minecraft kullanıcı adı').setRequired(true))
+        )
+        .addSubcommand(sub =>
+            sub.setName('liste')
+                .setDescription('Tüm whitelist\'i ve aktif oturumları göster')
+        )
+        .addSubcommand(sub =>
+            sub.setName('hwid-reset')
+                .setDescription('Kullanıcının HWID\'sini sıfırla')
+                .addStringOption(opt => opt.setName('isim').setDescription('Minecraft kullanıcı adı').setRequired(true))
+        );
+
+    // ── Permission Check ──
+    function isAdmin(userId) {
+        return DISCORD_ADMIN_IDS.length === 0 || DISCORD_ADMIN_IDS.includes(userId);
+    }
+
+    // ── Bot Ready: Register Commands ──
+    client.once('ready', async () => {
+        console.log(`[Discord Bot] ✅ Logged in as ${client.user.tag}`);
+        console.log(`[Discord Bot] Admin IDs: ${DISCORD_ADMIN_IDS.length > 0 ? DISCORD_ADMIN_IDS.join(', ') : 'ALL (no restriction)'}`);
+
+        try {
+            const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
+            await rest.put(Routes.applicationCommands(client.user.id), {
+                body: [whitelistCmd.toJSON()]
+            });
+            console.log(`[Discord Bot] ✅ Slash commands registered globally.`);
+        } catch (err) {
+            console.error(`[Discord Bot] ❌ Failed to register commands:`, err.message);
+        }
+    });
+
+    // ── Handle Slash Commands ──
+    client.on('interactionCreate', async (interaction) => {
+        if (!interaction.isChatInputCommand()) return;
+        if (interaction.commandName !== 'whitelist') return;
+
+        // Permission check
+        if (!isAdmin(interaction.user.id)) {
+            return interaction.reply({ content: '❌ Bu komutu kullanma yetkiniz yok.', ephemeral: true });
+        }
+
+        const sub = interaction.options.getSubcommand();
+
+        // ── /whitelist ekle ──
+        if (sub === 'ekle') {
+            const username = interaction.options.getString('isim');
+            const tier = interaction.options.getString('tier') || 'user';
+
+            const existing = findWhitelistUser(username);
+            if (existing) {
+                return interaction.reply({ embeds: [
+                    new EmbedBuilder().setColor(0xFF0000).setDescription(`❌ **${username}** zaten whitelist'te.`)
+                ], ephemeral: true });
+            }
+
+            runtimeWhitelist.push({ username, hwid: null, tier });
+            console.log(`[Discord Bot] ➕ ${interaction.user.tag} added: ${username} (tier: ${tier})`);
+
+            return interaction.reply({ embeds: [
+                new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('✅ Kullanıcı Eklendi')
+                    .addFields(
+                        { name: 'Kullanıcı', value: `\`${username}\``, inline: true },
+                        { name: 'Tier', value: `\`${tier}\``, inline: true },
+                        { name: 'HWID', value: 'İlk girişte bağlanacak', inline: true }
+                    )
+                    .setTimestamp()
+            ] });
+        }
+
+        // ── /whitelist sil ──
+        if (sub === 'sil') {
+            const username = interaction.options.getString('isim');
+            const idx = runtimeWhitelist.findIndex(u => u.username.toLowerCase() === username.toLowerCase());
+
+            if (idx === -1) {
+                return interaction.reply({ embeds: [
+                    new EmbedBuilder().setColor(0xFF0000).setDescription(`❌ **${username}** whitelist'te bulunamadı.`)
+                ], ephemeral: true });
+            }
+
+            const removed = runtimeWhitelist.splice(idx, 1)[0];
+
+            // Kill active sessions
+            let killedSessions = 0;
+            for (const [token, session] of activeSessions.entries()) {
+                if (session.username.toLowerCase() === username.toLowerCase()) {
+                    activeSessions.delete(token);
+                    killedSessions++;
+                }
+            }
+
+            console.log(`[Discord Bot] ➖ ${interaction.user.tag} removed: ${removed.username} (${killedSessions} sessions killed)`);
+
+            return interaction.reply({ embeds: [
+                new EmbedBuilder()
+                    .setColor(0xFF4444)
+                    .setTitle('🗑️ Kullanıcı Silindi')
+                    .addFields(
+                        { name: 'Kullanıcı', value: `\`${removed.username}\``, inline: true },
+                        { name: 'Kapatılan Oturumlar', value: `\`${killedSessions}\``, inline: true }
+                    )
+                    .setTimestamp()
+            ] });
+        }
+
+        // ── /whitelist liste ──
+        if (sub === 'liste') {
+            const userLines = runtimeWhitelist.map((u, i) => {
+                const hwidStatus = u.hwid ? `🔒 ${u.hwid.substring(0, 8)}...` : '⬜ Bağlanmadı';
+                return `**${i + 1}.** \`${u.username}\` — ${u.tier} — ${hwidStatus}`;
+            });
+
+            const sessionLines = [];
+            for (const [token, s] of activeSessions.entries()) {
+                const uptime = Math.floor((Date.now() - s.createdAt) / 60000);
+                const lastHb = Math.floor((Date.now() - s.lastHeartbeat) / 1000);
+                sessionLines.push(`🟢 \`${s.username}\` — ${uptime}dk aktif — son sinyal: ${lastHb}sn önce`);
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle('📋 Whitelist Durumu')
+                .addFields(
+                    { name: `Kayıtlı Kullanıcılar (${runtimeWhitelist.length})`, value: userLines.join('\n') || 'Boş' },
+                    { name: `Aktif Oturumlar (${activeSessions.size})`, value: sessionLines.join('\n') || 'Hiç aktif oturum yok' }
+                )
+                .setTimestamp();
+
+            return interaction.reply({ embeds: [embed] });
+        }
+
+        // ── /whitelist hwid-reset ──
+        if (sub === 'hwid-reset') {
+            const username = interaction.options.getString('isim');
+            const user = findWhitelistUser(username);
+
+            if (!user) {
+                return interaction.reply({ embeds: [
+                    new EmbedBuilder().setColor(0xFF0000).setDescription(`❌ **${username}** whitelist'te bulunamadı.`)
+                ], ephemeral: true });
+            }
+
+            user.hwid = null;
+            console.log(`[Discord Bot] 🔄 ${interaction.user.tag} reset HWID for: ${username}`);
+
+            return interaction.reply({ embeds: [
+                new EmbedBuilder()
+                    .setColor(0xFFAA00)
+                    .setTitle('🔄 HWID Sıfırlandı')
+                    .setDescription(`**${username}** kullanıcısının HWID'si sıfırlandı.\nBir sonraki girişte yeni bilgisayarına bağlanacak.`)
+                    .setTimestamp()
+            ] });
+        }
+    });
+
+    // ── Start Bot ──
+    client.login(DISCORD_BOT_TOKEN).catch(err => {
+        console.error(`[Discord Bot] ❌ Login failed:`, err.message);
+    });
+} else {
+    console.log('[Discord Bot] ⚠️ DISCORD_BOT_TOKEN not set. Whitelist bot disabled.');
+    console.log('[Discord Bot]   Set DISCORD_BOT_TOKEN and DISCORD_ADMIN_IDS in environment variables to enable.');
+}
